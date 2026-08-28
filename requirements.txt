@@ -1,0 +1,6 @@
+py-clob-client>=0.19.0
+python-dotenv>=1.0.0
+
+# compare_markets.py
+requests>=2.31.0
+sentence-transformers>=3.0.0

@@ -603,7 +603,12 @@ def _render_rows(pairs):
         elif has_loss:
             arb_str = f"{best_arb:.3f}"
             arb_class = ""
-            label_html = '<div class="arb-loss">LOSS</div>'
+            # A value that rounds to 0.000 at the displayed precision isn't
+            # really a "loss" -- the two best asks land on exactly $1, i.e.
+            # break-even -- so it gets its own neutral "Balanced" label
+            # rather than the red/lilac LOSS marker.
+            is_balanced = arb_str in ("0.000", "-0.000")
+            label_html = f'<div class="arb-loss">{"Balanced" if is_balanced else "LOSS"}</div>'
         else:
             arb_str = "-"
             arb_class = ""

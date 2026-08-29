@@ -576,16 +576,38 @@ def _render_rows(pairs):
         pm_no_ask = f"{pm.no_ask:.3f}" if pm.no_ask is not None else "n/a"
         km_yes_ask = f"{km.yes_ask:.3f}" if km.yes_ask is not None else "n/a"
         km_no_ask = f"{km.no_ask:.3f}" if km.no_ask is not None else "n/a"
-        # Only show a value when there's a genuine positive hedge (1 > yes_ask
-        # + no_ask on the two platforms). A non-positive result (best asks add
-        # up to $1 or more -- no guaranteed arbitrage) and a missing-data
-        # result (a side's price wasn't available at all) both just render as
-        # a plain dash rather than a misleading negative number or a wall of
-        # text.
-        has_arb = best_arb is not None and best_arb > 0
-        arb_str = f"{best_arb:+.3f}" if has_arb else "-"
-        arb_class = _magnitude_class(best_arb)
-        label_html = f'<div class="arb-label">{best_arb_label}</div>' if has_arb else ""
+        # best_arb (computed upstream in build_section_pairs) is already
+        # "whichever combo is available": if both PM-Yes+Kalshi-No and
+        # PM-No+Kalshi-Yes are quoted it's the better of the two, and if only
+        # one side has both asks quoted it's simply that one combo's value --
+        # so the same threshold logic below handles the "missing one best
+        # ask" case automatically, with no separate branch needed.
+        #
+        # A row shows one of three things in the Best-Arb column:
+        #   - a genuine positive hedge (best_arb > 0, i.e. the two best asks
+        #     sum to less than $1): "+0.XXX" plus a label naming which combo
+        #     achieves it -- the normal profit display.
+        #   - a guaranteed loss (best_arb <= 0, i.e. the best available
+        #     combo's best asks sum to $1 or more): the actual (negative)
+        #     value -- 1 minus that sum -- plus a red "LOSS" marker, so it's
+        #     clear this pair was evaluated and found unprofitable rather
+        #     than silently missing data.
+        #   - truly missing data (best_arb is None, i.e. neither combo had
+        #     both asks quoted at all): a plain dash.
+        has_profit = best_arb is not None and best_arb > 0
+        has_loss = best_arb is not None and best_arb <= 0
+        if has_profit:
+            arb_str = f"{best_arb:+.3f}"
+            arb_class = _magnitude_class(best_arb)
+            label_html = f'<div class="arb-label">{best_arb_label}</div>'
+        elif has_loss:
+            arb_str = f"{best_arb:.3f}"
+            arb_class = ""
+            label_html = '<div class="arb-loss">LOSS</div>'
+        else:
+            arb_str = "-"
+            arb_class = ""
+            label_html = ""
 
         row_class = "row-new" if is_new else ""
         new_badge = '<span class="new-badge">NEW</span> ' if is_new else ""
@@ -742,6 +764,7 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
   .diff-medium {{ color: #ffa94d; font-weight: 600; }}
   .diff-large {{ color: #51cf66; font-weight: 700; }}
   .arb-label {{ font-size: 10px; font-weight: 400; color: #999; text-align: right; }}
+  .arb-loss {{ font-size: 10px; font-weight: 700; color: #c8a2c8; text-align: right; text-transform: uppercase; letter-spacing: 0.04em; }}
   .countdown {{ font-size: 9px; font-weight: 400; color: #667; text-align: right; font-variant-numeric: tabular-nums; }}
   /* Flashed on briefly (via JS) right before each auto-refresh reload, so
      the price swap reads as a visible "blackout, then new price" beat
@@ -750,7 +773,7 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
      surrounding page rather than punching a black hole in a dark-but-not-
      black UI. */
   body.price-refreshing td.price.ask, body.price-refreshing td.price.divider {{ background: #0b0e14; color: #0b0e14 !important; }}
-  body.price-refreshing td.price.ask .countdown, body.price-refreshing td.price.divider .arb-label {{ color: #0b0e14 !important; }}
+  body.price-refreshing td.price.ask .countdown, body.price-refreshing td.price.divider .arb-label, body.price-refreshing td.price.divider .arb-loss {{ color: #0b0e14 !important; }}
   tr:hover {{ background: #161a24; }}
   .new-badge {{ display: inline-block; background: #2f9e44; color: #fff; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 1px 5px; border-radius: 3px; vertical-align: middle; margin-right: 4px; }}
   tr.row-new {{ background: #132417; }}
@@ -784,7 +807,8 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     <span style="color:#ff6b6b">red = smallest (&lt; 0.01)</span>,
     <span style="color:#ffa94d">amber = medium (0.01&ndash;0.03)</span>,
     <span style="color:#51cf66">green = largest (&ge; 0.03)</span>;
-    shown as &ndash; when there's no guaranteed hedge (the two best asks add up to $1 or more) or a side's price is missing entirely.
+    shown as the (negative) value with a <span class="arb-loss">LOSS</span> marker when the best available combo's two best asks add up to $1 or more (i.e. no guaranteed hedge);
+    shown as &ndash; only when a market is missing best-ask data on both possible combos entirely.
     Prices refreshed {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{' (auto-refreshing every ' + str(refresh_seconds) + 's -- countdown shown under each ask price)' if refresh_seconds else ''}.{match_note}{new_note}
   </div>
   {''.join(section_blocks)}

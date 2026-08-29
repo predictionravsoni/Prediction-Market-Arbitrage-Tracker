@@ -242,7 +242,14 @@ class PMMarket:
     url: str
     yes_price: float | None = None
     yes_ask: float | None = None
+    yes_bid: float | None = None
     description: str = ""
+
+    @property
+    def no_ask(self):
+        # Best ask to buy No = 1 - best bid for Yes (selling Yes at the bid
+        # is economically equivalent to buying No at 1-bid).
+        return 1 - self.yes_bid if self.yes_bid is not None else None
 
 
 @dataclass
@@ -259,6 +266,10 @@ class KalshiMarket:
         if self.yes_bid is not None and self.yes_ask is not None:
             return (self.yes_bid + self.yes_ask) / 2
         return self.yes_bid if self.yes_bid is not None else self.yes_ask
+
+    @property
+    def no_ask(self):
+        return 1 - self.yes_bid if self.yes_bid is not None else None
 
 
 def fetch_polymarket_markets(tag_ids, limit=None):
@@ -290,8 +301,9 @@ def fetch_polymarket_markets(tag_ids, limit=None):
                         yes_price = float(prices[0])
                 except Exception:
                     pass
-                if yes_price is None and m.get("bestBid") is not None and m.get("bestAsk") is not None:
-                    yes_price = (float(m["bestBid"]) + float(m["bestAsk"])) / 2
+                yes_bid = float(m["bestBid"]) if m.get("bestBid") is not None else None
+                if yes_price is None and yes_bid is not None and m.get("bestAsk") is not None:
+                    yes_price = (yes_bid + float(m["bestAsk"])) / 2
                 yes_ask = float(m["bestAsk"]) if m.get("bestAsk") is not None else None
                 # The market's own "slug" only resolves to a real page for
                 # single-market events. For grouped/multi-outcome events
@@ -306,6 +318,7 @@ def fetch_polymarket_markets(tag_ids, limit=None):
                     url=f"https://polymarket.com/event/{event_slug or m.get('slug', '')}",
                     yes_price=yes_price,
                     yes_ask=yes_ask,
+                    yes_bid=yes_bid,
                     description=(m.get("description") or "").strip(),
                 )
             offset += page_size
@@ -404,7 +417,7 @@ def fetch_polymarket_prices_batch(ids, chunk_size=50):
     ids, via repeated `id` query params in one request per chunk (confirmed
     Gamma supports this -- much cheaper than re-listing the whole active
     market set)."""
-    prices: dict[str, tuple[float | None, float | None]] = {}
+    prices: dict[str, tuple[float | None, float | None, float | None]] = {}
     for i in range(0, len(ids), chunk_size):
         chunk = ids[i : i + chunk_size]
         resp = requests.get(
@@ -422,10 +435,11 @@ def fetch_polymarket_prices_batch(ids, chunk_size=50):
                     yes_price = float(out_prices[0])
             except Exception:
                 pass
-            if yes_price is None and m.get("bestBid") is not None and m.get("bestAsk") is not None:
-                yes_price = (float(m["bestBid"]) + float(m["bestAsk"])) / 2
+            yes_bid = float(m["bestBid"]) if m.get("bestBid") is not None else None
+            if yes_price is None and yes_bid is not None and m.get("bestAsk") is not None:
+                yes_price = (yes_bid + float(m["bestAsk"])) / 2
             yes_ask = float(m["bestAsk"]) if m.get("bestAsk") is not None else None
-            prices[m["id"]] = (yes_price, yes_ask)
+            prices[m["id"]] = (yes_price, yes_ask, yes_bid)
     return prices
 
 
@@ -530,42 +544,49 @@ def embed(model, texts):
     return model.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True)
 
 
+def _magnitude_class(value):
+    # Color by size of the guaranteed-hedge profit: >=0 only, since a
+    # negative value means there's no arbitrage on this pair at all.
+    if value is None or value <= 0:
+        return ""
+    if value >= 0.03:
+        return "diff-large"
+    elif value >= 0.01:
+        return "diff-medium"
+    else:
+        return "diff-small"
+
+
 def _render_rows(pairs):
     rows = []
-    for score, pm, km, diff, ask_diff, is_new, risk in pairs:
-        pm_price = f"{pm.yes_price:.3f}" if pm.yes_price is not None else "n/a"
-        km_price = f"{km.yes_mid:.3f}" if km.yes_mid is not None else "n/a"
-        pm_ask = f"{pm.yes_ask:.3f}" if pm.yes_ask is not None else "n/a"
-        km_ask = f"{km.yes_ask:.3f}" if km.yes_ask is not None else "n/a"
-        diff_str = f"{diff:+.3f}" if diff is not None else "n/a"
-        ask_diff_str = f"{ask_diff:+.3f}" if ask_diff is not None else "n/a"
+    for score, pm, km, best_arb, best_arb_label, is_new, risk in pairs:
+        pm_yes_ask = f"{pm.yes_ask:.3f}" if pm.yes_ask is not None else "n/a"
+        pm_no_ask = f"{pm.no_ask:.3f}" if pm.no_ask is not None else "n/a"
+        km_yes_ask = f"{km.yes_ask:.3f}" if km.yes_ask is not None else "n/a"
+        km_no_ask = f"{km.no_ask:.3f}" if km.no_ask is not None else "n/a"
+        # Only show a value when there's a genuine positive hedge (1 > yes_ask
+        # + no_ask on the two platforms). A non-positive result (best asks add
+        # up to $1 or more -- no guaranteed arbitrage) and a missing-data
+        # result (a side's price wasn't available at all) both just render as
+        # a plain dash rather than a misleading negative number or a wall of
+        # text.
+        has_arb = best_arb is not None and best_arb > 0
+        arb_str = f"{best_arb:+.3f}" if has_arb else "-"
+        arb_class = _magnitude_class(best_arb)
+        label_html = f'<div class="arb-label">{best_arb_label}</div>' if has_arb else ""
 
-        def _magnitude_class(value):
-            # Color by magnitude: largest diffs = green, medium = orange, smallest = red.
-            if value is None:
-                return ""
-            if abs(value) >= 0.05:
-                return "diff-large"
-            elif abs(value) >= 0.02:
-                return "diff-medium"
-            else:
-                return "diff-small"
-
-        diff_class = _magnitude_class(diff)
-        ask_diff_class = _magnitude_class(ask_diff)
         row_class = "row-new" if is_new else ""
         new_badge = '<span class="new-badge">NEW</span> ' if is_new else ""
         rows.append(f"""
         <tr class="{row_class}">
           <td class="score">{score:.4f}</td>
           <td>{new_badge}<a href="{pm.url}" target="_blank">{pm.title}</a></td>
-          <td class="price">{pm_price}</td>
-          <td class="price ask">{pm_ask}</td>
+          <td class="price ask">{pm_yes_ask}</td>
+          <td class="price ask">{pm_no_ask}</td>
           <td><a href="{km.url}" target="_blank">{km.title}</a></td>
-          <td class="price">{km_price}</td>
-          <td class="price ask">{km_ask}</td>
-          <td class="price divider {diff_class}">{diff_str}</td>
-          <td class="price ask {ask_diff_class}">{ask_diff_str}</td>
+          <td class="price ask">{km_yes_ask}</td>
+          <td class="price ask">{km_no_ask}</td>
+          <td class="price divider {arb_class}">{arb_str}{label_html}</td>
         </tr>""")
     return rows
 
@@ -574,7 +595,7 @@ def render_html(sections, out_path, refresh_seconds=None):
     """sections: list of dicts, one per category dropdown, each with:
         key            -- short slug used for HTML element ids (e.g. "politics")
         label          -- display name (e.g. "Politics")
-        pairs          -- list of (score, pm, km, diff, ask_diff, is_new, risk)
+        pairs          -- list of (score, pm, km, best_arb, best_arb_label, is_new, risk)
                            risk is None for a normal match, or "boundary"
                            for a STRICT_VS_INCLUSIVE match -- rendered in a
                            separate "HIGHER RISK" sub-table at the bottom
@@ -601,9 +622,9 @@ def render_html(sections, out_path, refresh_seconds=None):
     new_note = f" <span class=\"new-badge\">{total_new} NEW</span> pair(s) found by the scanner since the last full rebuild." if total_new else ""
 
     thead = """<thead><tr>
-      <th>Cosine</th><th>Polymarket question</th><th>PM Yes</th><th class="ask">PM Ask</th>
-      <th>Kalshi question</th><th>Kalshi Yes</th><th class="ask">Kalshi Ask</th>
-      <th class="divider">Yes Diff</th><th class="ask">Ask Diff</th>
+      <th>Cosine</th><th>Polymarket question</th><th class="ask">PM Yes Ask</th><th class="ask">PM No Ask</th>
+      <th>Kalshi question</th><th class="ask">Kalshi Yes Ask</th><th class="ask">Kalshi No Ask</th>
+      <th class="divider">Best Arb</th>
     </tr></thead>"""
 
     section_blocks = []
@@ -639,7 +660,7 @@ def render_html(sections, out_path, refresh_seconds=None):
   <table id="t-{s['key']}">
     {thead}
     <tbody>
-      {''.join(rows) if rows else f'<tr><td colspan="9">No live {s["label"]} pairs found at this threshold.</td></tr>'}
+      {''.join(rows) if rows else f'<tr><td colspan="8">No live {s["label"]} pairs found at this threshold.</td></tr>'}
     </tbody>
   </table>
   {risk_block}
@@ -672,13 +693,12 @@ def render_html(sections, out_path, refresh_seconds=None):
      of how long that table's particular question text happens to be. */
   th:nth-child(1), td:nth-child(1) {{ width: 6%; }}
   th:nth-child(2), td:nth-child(2) {{ width: 25%; }}
-  th:nth-child(3), td:nth-child(3) {{ width: 7%; }}
-  th:nth-child(4), td:nth-child(4) {{ width: 7%; }}
+  th:nth-child(3), td:nth-child(3) {{ width: 8%; }}
+  th:nth-child(4), td:nth-child(4) {{ width: 8%; }}
   th:nth-child(5), td:nth-child(5) {{ width: 25%; }}
-  th:nth-child(6), td:nth-child(6) {{ width: 7%; }}
-  th:nth-child(7), td:nth-child(7) {{ width: 7%; }}
-  th:nth-child(8), td:nth-child(8) {{ width: 8%; }}
-  th:nth-child(9), td:nth-child(9) {{ width: 8%; }}
+  th:nth-child(6), td:nth-child(6) {{ width: 8%; }}
+  th:nth-child(7), td:nth-child(7) {{ width: 8%; }}
+  th:nth-child(8), td:nth-child(8) {{ width: 12%; }}
   a {{ color: #7aa2ff; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
   .price {{ font-variant-numeric: tabular-nums; text-align: right; }}
@@ -688,6 +708,7 @@ def render_html(sections, out_path, refresh_seconds=None):
   .diff-small {{ color: #ff6b6b; font-weight: 600; }}
   .diff-medium {{ color: #ffa94d; font-weight: 600; }}
   .diff-large {{ color: #51cf66; font-weight: 700; }}
+  .arb-label {{ font-size: 10px; font-weight: 400; color: #999; text-align: right; }}
   tr:hover {{ background: #161a24; }}
   .new-badge {{ display: inline-block; background: #2f9e44; color: #fff; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 1px 5px; border-radius: 3px; vertical-align: middle; margin-right: 4px; }}
   tr.row-new {{ background: #132417; }}
@@ -699,16 +720,19 @@ def render_html(sections, out_path, refresh_seconds=None):
     <div class="brand">PREDICTION MARKET ARBITRAGE TRACKER</div>
     <div class="author">Neerav Soni</div>
   </div>
-  <h1>Matched market pairs — Yes-side price comparison</h1>
+  <h1>Matched market pairs — cross-platform hedge arbitrage</h1>
   <div class="sub">
-    {total_pairs} live pairs across {len(sections)} categories. Polymarket price = mid(bestBid, bestAsk) or outcomePrices[Yes].
-    Kalshi price = mid(yes_bid, 1&minus;no_bid) derived from the live orderbook.
-    <span class="ask">Lilac = best ask</span> (Polymarket bestAsk; Kalshi 1&minus;best no bid).
-    Diff = Polymarket &minus; Kalshi, colored by |diff| magnitude:
-    <span style="color:#ff6b6b">red = smallest (&lt; 0.02)</span>,
-    <span style="color:#ffa94d">orange = medium (0.02&ndash;0.05)</span>,
-    <span style="color:#51cf66">green = largest (&ge; 0.05)</span>.
-    Ask Diff = Polymarket ask &minus; Kalshi ask, colored by the same red/orange/green |diff| magnitude scale.
+    {total_pairs} live pairs across {len(sections)} categories.
+    <span class="ask">Lilac = best ask</span> for each side: PM Yes/No ask from Polymarket's bestBid/bestAsk (No ask = 1&minus;Yes bid);
+    Kalshi Yes/No ask derived from its live orderbook the same way.
+    Best Arb = the larger of the two guaranteed-hedge payoffs on a matched pair (buying the opposite outcome on each
+    platform always pays exactly $1 if the two markets resolve identically, before fees/gas/slippage):
+    1.00 &minus; (PM Yes ask + Kalshi No ask), or 1.00 &minus; (PM No ask + Kalshi Yes ask) &mdash; whichever is larger, with its direction labeled underneath.
+    Colored by size when positive:
+    <span style="color:#ff6b6b">red = smallest (&lt; 0.01)</span>,
+    <span style="color:#ffa94d">amber = medium (0.01&ndash;0.03)</span>,
+    <span style="color:#51cf66">green = largest (&ge; 0.03)</span>;
+    shown as &ndash; when there's no guaranteed hedge (the two best asks add up to $1 or more) or a side's price is missing entirely.
     Prices refreshed {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{' (auto-refreshing every ' + str(refresh_seconds) + 's)' if refresh_seconds else ''}.{match_note}{new_note}
   </div>
   {''.join(section_blocks)}
@@ -861,8 +885,17 @@ def scan_for_new_matches(model, universe_path, threshold, pm_tag_ids, kalshi_cat
 
 def build_section_pairs(cache):
     """Refresh live prices for one category's cached match set and return
-    the (score, pm, km, diff, ask_diff, is_new, risk) rows render_html expects,
-    plus how many of them are freshly-scanner-found ("NEW")."""
+    the (score, pm, km, best_arb, best_arb_label, is_new, risk) rows
+    render_html expects, plus how many of them are freshly-scanner-found
+    ("NEW").
+
+    best_arb is the larger of the two guaranteed-hedge payoffs for a
+    matched pair (buying the opposite side on each platform always pays
+    out exactly $1 if the two markets truly resolve identically):
+        1.00 - (Polymarket Yes ask + Kalshi No ask)   -- buy PM Yes + K No
+        1.00 - (Polymarket No ask  + Kalshi Yes ask)   -- buy PM No + K Yes
+    A positive value is the guaranteed profit per $1 of eventual payout,
+    before fees/gas/slippage."""
     pairs_meta = cache["pairs"]
     pm_ids = [p["pm_id"] for p in pairs_meta]
     pm_prices = fetch_polymarket_prices_batch(pm_ids) if pm_ids else {}
@@ -875,18 +908,20 @@ def build_section_pairs(cache):
     pairs = []
     new_count = 0
     for p, km in zip(pairs_meta, kalshi_markets):
-        pm_yes_price, pm_yes_ask = pm_prices.get(p["pm_id"], (None, None))
-        pm = PMMarket(id=p["pm_id"], title=p["pm_title"], url=p["pm_url"], yes_price=pm_yes_price, yes_ask=pm_yes_ask)
-        diff = None
-        if pm.yes_price is not None and km.yes_mid is not None:
-            diff = pm.yes_price - km.yes_mid
-        ask_diff = None
-        if pm.yes_ask is not None and km.yes_ask is not None:
-            ask_diff = pm.yes_ask - km.yes_ask
+        pm_yes_price, pm_yes_ask, pm_yes_bid = pm_prices.get(p["pm_id"], (None, None, None))
+        pm = PMMarket(id=p["pm_id"], title=p["pm_title"], url=p["pm_url"], yes_price=pm_yes_price, yes_ask=pm_yes_ask, yes_bid=pm_yes_bid)
+
+        candidates = []
+        if pm.yes_ask is not None and km.no_ask is not None:
+            candidates.append((1.00 - (pm.yes_ask + km.no_ask), "Buy PM Yes + Kalshi No"))
+        if pm.no_ask is not None and km.yes_ask is not None:
+            candidates.append((1.00 - (pm.no_ask + km.yes_ask), "Buy PM No + Kalshi Yes"))
+        best_arb, best_arb_label = max(candidates, key=lambda c: c[0]) if candidates else (None, None)
+
         is_new = (now - p.get("first_seen", 0)) < NEW_BADGE_WINDOW_SECONDS
         if is_new:
             new_count += 1
-        pairs.append((p["score"], pm, km, diff, ask_diff, is_new, p.get("risk")))
+        pairs.append((p["score"], pm, km, best_arb, best_arb_label, is_new, p.get("risk")))
     return pairs, new_count
 
 

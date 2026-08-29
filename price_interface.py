@@ -668,9 +668,18 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     # A "profit opportunity" is a pair with a genuine positive hedge (same
     # threshold _render_rows uses to decide between the +profit display and
     # the LOSS/Balanced/dash displays): best_arb is not None and > 0.
-    total_profit_opportunities = sum(
-        1 for s in sections for p in s["pairs"] if p[3] is not None and p[3] > 0
-    )
+    profitable_arbs = [p[3] for s in sections for p in s["pairs"] if p[3] is not None and p[3] > 0]
+    total_profit_opportunities = len(profitable_arbs)
+    # Aggregate ROI across every profitable pair, assuming $1 notional per
+    # pair: best_arb IS the profit per $1 notional (best_arb = 1 - cost, by
+    # construction in build_section_pairs), so cost = 1 - best_arb. Summing
+    # profit and cost separately (rather than averaging the per-pair %)
+    # weights the aggregate by how much capital each opportunity actually
+    # requires, e.g. a $0.98 total-cost pair barely moves the number even if
+    # its individual % looks similar to a $0.60 total-cost pair.
+    total_profit_dollars = sum(profitable_arbs)
+    total_cost_dollars = sum(1.0 - a for a in profitable_arbs)
+    profit_pct = (total_profit_dollars / total_cost_dollars * 100.0) if total_cost_dollars > 0 else None
 
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     match_note = (
@@ -811,6 +820,11 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     <div class="status-item">
       <span class="status-label">Total profit opportunities</span>
       <span class="status-value profit-count">{total_profit_opportunities}</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-item">
+      <span class="status-label">Aggregate profit %</span>
+      <span class="status-value profit-count">{f'{profit_pct:.2f}%' if profit_pct is not None else '-'}</span>
     </div>
   </div>
   <h1>Matched market pairs — cross-platform hedge arbitrage</h1>

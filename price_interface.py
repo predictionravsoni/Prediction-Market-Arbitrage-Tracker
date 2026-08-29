@@ -106,6 +106,18 @@ NEW_BADGE_WINDOW_SECONDS = 15 * 60
 # to. New markets must never go undetected for more than an hour.
 MAX_SCAN_INTERVAL_SECONDS = 3600
 
+# Displayed page auto-refresh cadence (meta-refresh tag + per-price JS
+# countdown + blackout-flash timing). Deliberately decoupled from
+# --interval/args.interval, which continues to drive the *backend's* own
+# refresh-loop polling cadence unchanged. In practice a full refresh cycle
+# (Kalshi has no batch order-book endpoint, so each pair needs its own
+# request) takes long enough that the backend's real cadence naturally runs
+# closer to ~90s than to a nominal 60s --interval, so the on-page countdown
+# is pinned to 90s to match what users actually observe, rather than the
+# raw --interval value. The top-of-page status box is unaffected by this --
+# it always shows the real, actual backend refresh/scan timestamps.
+PAGE_REFRESH_DISPLAY_SECONDS = 90
+
 
 def economics_pair_ok(pm_title, k_title, pm_extra="", k_extra=""):
     """Extra correctness gate applied ONLY to the Economics category, on top
@@ -577,21 +589,25 @@ def _render_rows(pairs):
 
         row_class = "row-new" if is_new else ""
         new_badge = '<span class="new-badge">NEW</span> ' if is_new else ""
+        # Each ask price carries its own countdown badge (ticked down client-
+        # side by the <script> at the bottom of render_html) showing seconds
+        # remaining until the page's next auto-refresh pulls a new price.
+        countdown = '<div class="countdown"></div>'
         rows.append(f"""
         <tr class="{row_class}">
           <td class="score">{score:.4f}</td>
           <td>{new_badge}<a href="{pm.url}" target="_blank">{pm.title}</a></td>
-          <td class="price ask">{pm_yes_ask}</td>
-          <td class="price ask">{pm_no_ask}</td>
+          <td class="price ask">{pm_yes_ask}{countdown}</td>
+          <td class="price ask">{pm_no_ask}{countdown}</td>
           <td><a href="{km.url}" target="_blank">{km.title}</a></td>
-          <td class="price ask">{km_yes_ask}</td>
-          <td class="price ask">{km_no_ask}</td>
+          <td class="price ask">{km_yes_ask}{countdown}</td>
+          <td class="price ask">{km_no_ask}{countdown}</td>
           <td class="price divider {arb_class}">{arb_str}{label_html}</td>
         </tr>""")
     return rows
 
 
-def render_html(sections, out_path, refresh_seconds=None):
+def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, last_refresh_at=None):
     """sections: list of dicts, one per category dropdown, each with:
         key            -- short slug used for HTML element ids (e.g. "politics")
         label          -- display name (e.g. "Politics")
@@ -605,7 +621,20 @@ def render_html(sections, out_path, refresh_seconds=None):
         new_count      -- pairs newly found by the incremental scanner
         extra_filter   -- bool, whether an extra correctness filter (beyond
                            cosine) was applied for this category
+
+    last_scan_at, last_refresh_at: epoch seconds of the most recent
+    incremental new-market scan and most recent live-price refresh
+    (independent schedules -- see refresh_and_render/main's loop). Rendered
+    verbatim (to the second, with time zone) in the status box at the top of
+    the page. last_refresh_at defaults to "now" since render_html is always
+    called as part of a refresh.
     """
+    if last_refresh_at is None:
+        last_refresh_at = time.time()
+
+    def _fmt_ts(epoch):
+        return time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(epoch)) if epoch else "not yet run"
+
     total_pairs = sum(len(s["pairs"]) for s in sections)
     total_new = sum(s["new_count"] for s in sections)
     oldest_build = min((s["match_built_at"] for s in sections if s["match_built_at"]), default=None)
@@ -678,6 +707,10 @@ def render_html(sections, out_path, refresh_seconds=None):
   .page-header {{ display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #2a2f3a; padding-bottom: 12px; margin-bottom: 16px; }}
   .page-header .brand {{ font-size: 20px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }}
   .page-header .author {{ font-size: 14px; color: #999; }}
+  .status-box {{ display: flex; gap: 32px; flex-wrap: wrap; background: #12151c; border: 1px solid #2a2f3a; border-radius: 6px; padding: 10px 16px; margin: 16px 0 20px; }}
+  .status-item {{ display: flex; flex-direction: column; }}
+  .status-label {{ font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #999; margin-bottom: 3px; }}
+  .status-value {{ font-size: 14px; font-weight: 600; color: #e6e6e6; font-variant-numeric: tabular-nums; }}
   h1 {{ font-size: 18px; font-weight: 600; }}
   .category-heading {{ display: flex; align-items: center; font-size: 15px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #7aa2ff; border-bottom: 2px solid #2a2f3a; padding-bottom: 6px; margin: 20px 0 12px; cursor: pointer; user-select: none; }}
   .toggle-triangle {{ display: inline-block; width: 0; height: 0; margin-right: 8px; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid #7aa2ff; transition: transform 0.15s ease; transform: rotate(90deg); }}
@@ -709,6 +742,15 @@ def render_html(sections, out_path, refresh_seconds=None):
   .diff-medium {{ color: #ffa94d; font-weight: 600; }}
   .diff-large {{ color: #51cf66; font-weight: 700; }}
   .arb-label {{ font-size: 10px; font-weight: 400; color: #999; text-align: right; }}
+  .countdown {{ font-size: 9px; font-weight: 400; color: #667; text-align: right; font-variant-numeric: tabular-nums; }}
+  /* Flashed on briefly (via JS) right before each auto-refresh reload, so
+     the price swap reads as a visible "blackout, then new price" beat
+     instead of a silent in-place text change. Uses the page's own
+     background color (not pure black) so the flashed cells blend into the
+     surrounding page rather than punching a black hole in a dark-but-not-
+     black UI. */
+  body.price-refreshing td.price.ask, body.price-refreshing td.price.divider {{ background: #0b0e14; color: #0b0e14 !important; }}
+  body.price-refreshing td.price.ask .countdown, body.price-refreshing td.price.divider .arb-label {{ color: #0b0e14 !important; }}
   tr:hover {{ background: #161a24; }}
   .new-badge {{ display: inline-block; background: #2f9e44; color: #fff; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 1px 5px; border-radius: 3px; vertical-align: middle; margin-right: 4px; }}
   tr.row-new {{ background: #132417; }}
@@ -719,6 +761,16 @@ def render_html(sections, out_path, refresh_seconds=None):
   <div class="page-header">
     <div class="brand">PREDICTION MARKET ARBITRAGE TRACKER</div>
     <div class="author">Neerav Soni</div>
+  </div>
+  <div class="status-box">
+    <div class="status-item">
+      <span class="status-label">Last incremental market scan</span>
+      <span class="status-value">{_fmt_ts(last_scan_at)}</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Last price refresh</span>
+      <span class="status-value">{_fmt_ts(last_refresh_at)}</span>
+    </div>
   </div>
   <h1>Matched market pairs — cross-platform hedge arbitrage</h1>
   <div class="sub">
@@ -733,7 +785,7 @@ def render_html(sections, out_path, refresh_seconds=None):
     <span style="color:#ffa94d">amber = medium (0.01&ndash;0.03)</span>,
     <span style="color:#51cf66">green = largest (&ge; 0.03)</span>;
     shown as &ndash; when there's no guaranteed hedge (the two best asks add up to $1 or more) or a side's price is missing entirely.
-    Prices refreshed {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{' (auto-refreshing every ' + str(refresh_seconds) + 's)' if refresh_seconds else ''}.{match_note}{new_note}
+    Prices refreshed {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{' (auto-refreshing every ' + str(refresh_seconds) + 's -- countdown shown under each ask price)' if refresh_seconds else ''}.{match_note}{new_note}
   </div>
   {''.join(section_blocks)}
   <script>
@@ -743,6 +795,36 @@ def render_html(sections, out_path, refresh_seconds=None):
       var collapsed = heading.classList.toggle('collapsed');
       section.style.display = collapsed ? 'none' : '';
     }}
+
+    // Live per-price countdown to the next auto-refresh (the page itself
+    // reloads via <meta http-equiv="refresh">, which restarts this timer
+    // from the top on every reload).
+    (function() {{
+      var refreshSeconds = {refresh_seconds or 0};
+      if (refreshSeconds > 0) {{
+        var remaining = refreshSeconds;
+        var els = document.querySelectorAll('.countdown');
+        function tick() {{
+          var label = remaining + 's';
+          for (var i = 0; i < els.length; i++) els[i].textContent = label;
+          if (remaining > 0) remaining--;
+        }}
+        tick();
+        setInterval(tick, 1000);
+
+        // Blacks out every live price cell for the last stretch before the
+        // page's own <meta refresh> swaps in the freshly-written HTML, so
+        // each refresh reads as a visible "blackout, then new price" beat
+        // rather than a silent reload. BLACKOUT_MS is comfortably under
+        // half a second and timed off the same page-load clock the meta
+        // refresh itself uses, so the reveal lines up with the reload.
+        var BLACKOUT_MS = 350;
+        var blackoutDelay = Math.max(0, refreshSeconds * 1000 - BLACKOUT_MS);
+        setTimeout(function() {{
+          document.body.classList.add('price-refreshing');
+        }}, blackoutDelay);
+      }}
+    }})();
   </script>
 </body>
 </html>"""
@@ -925,10 +1007,17 @@ def build_section_pairs(cache):
     return pairs, new_count
 
 
-def refresh_and_render(caches, out_path, interval):
+def refresh_and_render(caches, out_path, interval, last_scan_at=None):
     """caches: dict of category_key -> match cache. Refreshes live prices
     for every category and writes a single HTML file with one dropdown
-    section per category."""
+    section per category.
+
+    last_scan_at: epoch seconds of the most recent incremental new-market
+    scan (across all categories), threaded through from main()'s loop so the
+    top-of-page status box can show it alongside this refresh's own
+    timestamp -- these run on independent schedules, so this function can't
+    infer the scan time on its own."""
+    last_refresh_at = time.time()
     sections = []
     for key, config in CATEGORY_CONFIGS.items():
         cache = caches[key]
@@ -942,7 +1031,12 @@ def refresh_and_render(caches, out_path, interval):
             "new_count": new_count,
             "extra_filter": config["extra_filter"] is not None,
         })
-    render_html(sections, out_path, refresh_seconds=interval)
+    # The meta-refresh/countdown/blackout display cadence is intentionally
+    # decoupled from `interval` (see PAGE_REFRESH_DISPLAY_SECONDS) -- only
+    # whether we're looping at all (interval truthy) matters here, not its
+    # exact value.
+    display_refresh_seconds = PAGE_REFRESH_DISPLAY_SECONDS if interval else None
+    render_html(sections, out_path, refresh_seconds=display_refresh_seconds, last_scan_at=last_scan_at, last_refresh_at=last_refresh_at)
 
 
 def _category_path(base_path, key):
@@ -1015,7 +1109,13 @@ def main():
     for key, config in CATEGORY_CONFIGS.items():
         caches[key], universe_paths[key] = load_or_build_category(key, config, args, model)
 
-    refresh_and_render(caches, args.out, args.interval or None)
+    # The startup pass above already ran the incremental scan for each
+    # category (unless --no-scan), so timestamp it as "now" for the status
+    # box; --no-scan means no scan actually happened yet, so leave it unset
+    # until the loop's first scan sets it for real.
+    startup_scan_at = None if args.no_scan else time.time()
+
+    refresh_and_render(caches, args.out, args.interval or None, last_scan_at=startup_scan_at)
     print(f"Wrote {args.out}")
     if not args.no_open:
         webbrowser.open(f"file://{args.out}")
@@ -1033,7 +1133,7 @@ def main():
         # scan/refresh schedule.
         tick = max(1, min(args.interval, scan_interval))
         print(f"Looping: price refresh every {args.interval}s, market scan every {scan_interval}s for all categories (Ctrl+C to stop)...")
-        last_scan = time.time()   # startup scan (if any) already ran above
+        last_scan = startup_scan_at or time.time()   # startup scan (if any) already ran above
         last_refresh = time.time()  # initial render already happened above
         try:
             while True:
@@ -1054,7 +1154,7 @@ def main():
                             print(f"  ...[{time.strftime('%H:%M:%S')}][{config['label']}] scan found {n_new_pm} new PM / {n_new_kalshi} new Kalshi markets, no new pairs")
                     last_scan = now
                 if found_new or now - last_refresh >= args.interval:
-                    refresh_and_render(caches, args.out, args.interval)
+                    refresh_and_render(caches, args.out, args.interval, last_scan_at=last_scan)
                     last_refresh = now
                     print(f"  ...refreshed {time.strftime('%H:%M:%S')}")
         except KeyboardInterrupt:

@@ -665,6 +665,12 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     total_pairs = sum(len(s["pairs"]) for s in sections)
     total_new = sum(s["new_count"] for s in sections)
     oldest_build = min((s["match_built_at"] for s in sections if s["match_built_at"]), default=None)
+    # A "profit opportunity" is a pair with a genuine positive hedge (same
+    # threshold _render_rows uses to decide between the +profit display and
+    # the LOSS/Balanced/dash displays): best_arb is not None and > 0.
+    total_profit_opportunities = sum(
+        1 for s in sections for p in s["pairs"] if p[3] is not None and p[3] > 0
+    )
 
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
     match_note = (
@@ -734,10 +740,12 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
   .page-header {{ display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #2a2f3a; padding-bottom: 12px; margin-bottom: 16px; }}
   .page-header .brand {{ font-size: 20px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }}
   .page-header .author {{ font-size: 14px; color: #999; }}
-  .status-box {{ display: flex; gap: 32px; flex-wrap: wrap; background: #12151c; border: 1px solid #2a2f3a; border-radius: 6px; padding: 10px 16px; margin: 16px 0 20px; }}
-  .status-item {{ display: flex; flex-direction: column; }}
+  .status-box {{ display: flex; align-items: stretch; gap: 32px; flex-wrap: wrap; background: #12151c; border: 1px solid #2a2f3a; border-radius: 6px; padding: 10px 16px; margin: 16px 0 20px; }}
+  .status-item {{ display: flex; flex-direction: column; justify-content: center; }}
   .status-label {{ font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #999; margin-bottom: 3px; }}
   .status-value {{ font-size: 14px; font-weight: 600; color: #e6e6e6; font-variant-numeric: tabular-nums; }}
+  .status-value.profit-count {{ color: #51cf66; font-size: 16px; }}
+  .status-divider {{ width: 1px; align-self: stretch; background: #2a2f3a; }}
   h1 {{ font-size: 18px; font-weight: 600; }}
   .category-heading {{ display: flex; align-items: center; font-size: 15px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #7aa2ff; border-bottom: 2px solid #2a2f3a; padding-bottom: 6px; margin: 20px 0 12px; cursor: pointer; user-select: none; }}
   .toggle-triangle {{ display: inline-block; width: 0; height: 0; margin-right: 8px; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid #7aa2ff; transition: transform 0.15s ease; transform: rotate(90deg); }}
@@ -798,6 +806,11 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     <div class="status-item">
       <span class="status-label">Last price refresh</span>
       <span class="status-value">{_fmt_ts(last_refresh_at)}</span>
+    </div>
+    <div class="status-divider"></div>
+    <div class="status-item">
+      <span class="status-label">Total profit opportunities</span>
+      <span class="status-value profit-count">{total_profit_opportunities}</span>
     </div>
   </div>
   <h1>Matched market pairs — cross-platform hedge arbitrage</h1>

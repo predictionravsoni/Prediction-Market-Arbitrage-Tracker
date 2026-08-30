@@ -82,6 +82,7 @@ Usage:
 import argparse
 import json
 import time
+import traceback
 import webbrowser
 from dataclasses import dataclass, field
 
@@ -1198,28 +1199,49 @@ def main():
         print(f"Looping: price refresh every {args.interval}s, market scan every {scan_interval}s for all categories (Ctrl+C to stop)...")
         last_scan = startup_scan_at or time.time()   # startup scan (if any) already ran above
         last_refresh = time.time()  # initial render already happened above
+        # Transient failures (DNS blips, connection resets, upstream 5xx that
+        # outlasts the inner per-request retry budget, etc.) must NOT kill
+        # this loop -- previously an unhandled requests.exceptions.
+        # ConnectionError (DNS resolution failure for gamma-api.polymarket.com)
+        # crashed the whole process silently, leaving the dashboard stale for
+        # hours with nothing left running to notice or recover. Any exception
+        # raised by a scan/refresh pass is now caught, logged, and backed off
+        # from -- neither last_scan nor last_refresh advance on failure, so
+        # the very next tick just retries the same overdue work. Consecutive
+        # failures back off (capped) so a sustained outage doesn't hammer the
+        # APIs, but the loop itself never exits except on Ctrl+C.
+        consecutive_failures = 0
         try:
             while True:
                 time.sleep(tick)
                 now = time.time()
-                found_new = False
-                if now - last_scan >= scan_interval:
-                    for key, config in CATEGORY_CONFIGS.items():
-                        pm_tag_ids = list(config["pm_tag_ids"].values())
-                        new_matches, n_new_pm, n_new_kalshi = scan_for_new_matches(
-                            model, universe_paths[key], config["threshold"], pm_tag_ids, config["kalshi_categories"], config["extra_filter"]
-                        )
-                        if new_matches:
-                            caches[key], added = merge_new_matches(caches[key], new_matches, _category_path(args.cache, key))
-                            found_new = True
-                            print(f"  ...[{time.strftime('%H:%M:%S')}][{config['label']}] scan found {n_new_pm} new PM / {n_new_kalshi} new Kalshi markets -> {added} new pair(s)")
-                        else:
-                            print(f"  ...[{time.strftime('%H:%M:%S')}][{config['label']}] scan found {n_new_pm} new PM / {n_new_kalshi} new Kalshi markets, no new pairs")
-                    last_scan = now
-                if found_new or now - last_refresh >= args.interval:
-                    refresh_and_render(caches, args.out, args.interval, last_scan_at=last_scan)
-                    last_refresh = now
-                    print(f"  ...refreshed {time.strftime('%H:%M:%S')}")
+                try:
+                    found_new = False
+                    if now - last_scan >= scan_interval:
+                        for key, config in CATEGORY_CONFIGS.items():
+                            pm_tag_ids = list(config["pm_tag_ids"].values())
+                            new_matches, n_new_pm, n_new_kalshi = scan_for_new_matches(
+                                model, universe_paths[key], config["threshold"], pm_tag_ids, config["kalshi_categories"], config["extra_filter"]
+                            )
+                            if new_matches:
+                                caches[key], added = merge_new_matches(caches[key], new_matches, _category_path(args.cache, key))
+                                found_new = True
+                                print(f"  ...[{time.strftime('%H:%M:%S')}][{config['label']}] scan found {n_new_pm} new PM / {n_new_kalshi} new Kalshi markets -> {added} new pair(s)")
+                            else:
+                                print(f"  ...[{time.strftime('%H:%M:%S')}][{config['label']}] scan found {n_new_pm} new PM / {n_new_kalshi} new Kalshi markets, no new pairs")
+                        last_scan = now
+                    if found_new or now - last_refresh >= args.interval:
+                        refresh_and_render(caches, args.out, args.interval, last_scan_at=last_scan)
+                        last_refresh = now
+                        print(f"  ...refreshed {time.strftime('%H:%M:%S')}")
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                    backoff = min(30 * consecutive_failures, 300)
+                    print(f"  ...[{time.strftime('%H:%M:%S')}] scan/refresh pass failed (failure #{consecutive_failures}), "
+                          f"backing off {backoff}s and retrying -- process stays up:")
+                    traceback.print_exc()
+                    time.sleep(backoff)
         except KeyboardInterrupt:
             print("Stopped.")
 

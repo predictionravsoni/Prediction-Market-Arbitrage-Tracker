@@ -1,6 +1,7 @@
 """
 Live price-comparison interface for matched Polymarket vs Kalshi market
-pairs, rendered as two collapsible dropdowns -- Politics and Economics.
+pairs, rendered as collapsible dropdowns -- one per category (see
+CATEGORY_CONFIGS): Politics, Economics, and Sports.
 
 Builds on compare_markets.py's matching logic, but instead of just listing
 matched pairs, it also pulls the current "Yes" side price from both platforms
@@ -21,6 +22,11 @@ Categories (see CATEGORY_CONFIGS):
       boundary-match + date-align alone still let ~77% of "matches" through
       that were actually bracket-edge/complement/threshold mismatches, not
       the same tradeable question.
+    - Sports:    cosine > 0.97 only, no extra_filter. Matches Politics'
+      "ULTRA SAME" floor as a conservative stand-in until a manual backtest
+      audit (like Economics got) is done -- manual spot-checking at a looser
+      0.9 floor showed clear false positives (same player/team, different
+      stat; different team, same tournament) even at the median score.
 
 Price sourcing:
     - Polymarket: Gamma API's /markets response already includes live
@@ -243,6 +249,21 @@ CATEGORY_CONFIGS = {
         "kalshi_categories": {"Economics"},
         "threshold": 0.85,
         "extra_filter": economics_pair_ok,
+    },
+    # Cosine-only, no extra_filter. A planned backtest audit against 0.93 was
+    # cancelled (Polymarket's Sports tag turned out to include a huge volume
+    # of live esports micro-markets -- e.g. "Any Player Ultra Kill?" -- that
+    # made a full-year backtest impractically slow to even fetch). Until that
+    # audit happens, threshold is raised to 0.97 (matching Politics' "ULTRA
+    # SAME" floor) as a conservative stand-in, since manual spot-checking at
+    # 0.9 showed clear false positives (same player/team, different stat;
+    # different team, same tournament) even at the median score.
+    "sports": {
+        "label": "Sports",
+        "pm_tag_ids": {"sports": 1},
+        "kalshi_categories": {"Sports"},
+        "threshold": 0.97,
+        "extra_filter": None,
     },
 }
 
@@ -1131,10 +1152,10 @@ def load_or_build_category(key, config, args, model):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Live price-comparison interface (Politics + Economics dropdowns) with an incremental new-market scanner.")
+    parser = argparse.ArgumentParser(description="Live price-comparison interface (Politics + Economics + Sports dropdowns) with an incremental new-market scanner.")
     parser.add_argument("--model", default="all-MiniLM-L6-v2")
     parser.add_argument("--out", default="/tmp/price_interface.html")
-    parser.add_argument("--cache", default="/tmp/price_interface_cache.json", help="Base path for the per-category matched-pair cache (a suffix is added per category, e.g. _politics/_economics)")
+    parser.add_argument("--cache", default="/tmp/price_interface_cache.json", help="Base path for the per-category matched-pair cache (a suffix is added per category, e.g. _politics/_economics/_sports)")
     parser.add_argument("--universe-cache", default="/tmp/price_interface_universe.npz", help="Base path for the per-category seen-market/embedding snapshot used by the incremental scanner")
     parser.add_argument("--interval", type=int, default=60, help="Loop forever, refreshing prices every N seconds (default 60s; pass 0 for a single one-shot render)")
     parser.add_argument("--scan-interval", type=int, default=900, help=f"How often (seconds) to scan for newly-listed markets while looping. Independent of --interval; hard-capped at {MAX_SCAN_INTERVAL_SECONDS}s (1hr) so new markets are never missed for longer than that (default 900s = 15min)")

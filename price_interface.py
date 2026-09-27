@@ -285,6 +285,13 @@ class PMMarket:
         # is economically equivalent to buying No at 1-bid).
         return 1 - self.yes_bid if self.yes_bid is not None else None
 
+    @property
+    def no_price(self):
+        # Last-traded No price = 1 - last-traded Yes price (yes_price is
+        # already Gamma's outcomePrices[0], i.e. the actual last trade, not a
+        # bid/ask) -- same complement convention used for no_ask above.
+        return 1 - self.yes_price if self.yes_price is not None else None
+
 
 @dataclass
 class KalshiMarket:
@@ -293,6 +300,7 @@ class KalshiMarket:
     url: str
     yes_bid: float | None = None
     yes_ask: float | None = None
+    last_price: float | None = None
     rules: str = ""
 
     @property
@@ -304,6 +312,12 @@ class KalshiMarket:
     @property
     def no_ask(self):
         return 1 - self.yes_bid if self.yes_bid is not None else None
+
+    @property
+    def last_no_price(self):
+        # Same complement convention as no_ask, applied to the last-traded
+        # Yes price instead of the Yes bid.
+        return 1 - self.last_price if self.last_price is not None else None
 
 
 def fetch_polymarket_markets(tag_ids, limit=None):
@@ -442,6 +456,43 @@ def fill_kalshi_orderbook_prices(kalshi_markets):
                     km.yes_ask = 1 - best_no_bid
             except Exception:
                 pass
+            break
+        time.sleep(0.05)
+
+
+def fill_kalshi_last_prices(kalshi_markets, chunk_size=100):
+    """Fetch last-traded Yes price for a set of matched Kalshi markets via the
+    batched GET /markets?tickers=...&limit=N endpoint, which reliably returns
+    a populated `last_price_dollars` field -- unlike the bulk /events listing
+    (used by fetch_kalshi_markets) which returns null last_price for almost
+    all markets. Confirmed this endpoint supports comma-separated `tickers=`
+    batching (tested up to 100 tickers in one request)."""
+    by_ticker = {km.ticker: km for km in kalshi_markets}
+    tickers = list(by_ticker.keys())
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        for attempt in range(4):
+            resp = requests.get(
+                f"{KALSHI_API}/markets",
+                params={"tickers": ",".join(chunk), "limit": len(chunk)},
+                timeout=20,
+            )
+            if resp.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            for m in data.get("markets", []):
+                km = by_ticker.get(m.get("ticker"))
+                if km is None:
+                    continue
+                last = m.get("last_price_dollars")
+                if last is not None:
+                    try:
+                        km.last_price = float(last)
+                    except (TypeError, ValueError):
+                        pass
             break
         time.sleep(0.05)
 
@@ -591,56 +642,66 @@ def _magnitude_class(value):
         return "diff-small"
 
 
+def _format_arb_cell(value, label):
+    # An arb value (Immediate or Possible) shows one of three things:
+    #   - a genuine positive hedge (value > 0, i.e. the two prices sum to
+    #     less than $1): "+0.XXX" plus a label naming which combo achieves
+    #     it -- the normal profit display.
+    #   - a guaranteed loss (value <= 0, i.e. the best available combo's
+    #     prices sum to $1 or more): the actual (negative) value -- 1 minus
+    #     that sum -- plus a red "LOSS" marker, so it's clear this pair was
+    #     evaluated and found unprofitable rather than silently missing data.
+    #   - truly missing data (value is None, i.e. neither combo had both
+    #     sides quoted at all): a plain dash.
+    has_profit = value is not None and value > 0
+    has_loss = value is not None and value <= 0
+    if has_profit:
+        val_str = f"{value:+.3f}"
+        css_class = _magnitude_class(value)
+        label_html = f'<div class="arb-label">{label}</div>'
+    elif has_loss:
+        val_str = f"{value:.3f}"
+        css_class = ""
+        # A value that rounds to 0.000 at the displayed precision isn't
+        # really a "loss" -- the two prices land on exactly $1, i.e.
+        # break-even -- so it gets its own neutral "Balanced" label rather
+        # than the red/lilac LOSS marker.
+        is_balanced = val_str in ("0.000", "-0.000")
+        label_html = f'<div class="arb-loss">{"Balanced" if is_balanced else "LOSS"}</div>'
+    else:
+        val_str = "-"
+        css_class = ""
+        label_html = ""
+    return val_str, css_class, label_html
+
+
 def _render_rows(pairs):
     rows = []
-    for score, pm, km, best_arb, best_arb_label, is_new, risk in pairs:
+    for score, pm, km, best_arb, best_arb_label, heuristic_arb, heuristic_arb_label, possible_arb, possible_arb_label, is_new, risk in pairs:
         pm_yes_ask = f"{pm.yes_ask:.3f}" if pm.yes_ask is not None else "n/a"
         pm_no_ask = f"{pm.no_ask:.3f}" if pm.no_ask is not None else "n/a"
         km_yes_ask = f"{km.yes_ask:.3f}" if km.yes_ask is not None else "n/a"
         km_no_ask = f"{km.no_ask:.3f}" if km.no_ask is not None else "n/a"
-        # best_arb (computed upstream in build_section_pairs) is already
-        # "whichever combo is available": if both PM-Yes+Kalshi-No and
-        # PM-No+Kalshi-Yes are quoted it's the better of the two, and if only
-        # one side has both asks quoted it's simply that one combo's value --
-        # so the same threshold logic below handles the "missing one best
-        # ask" case automatically, with no separate branch needed.
-        #
-        # A row shows one of three things in the Best-Arb column:
-        #   - a genuine positive hedge (best_arb > 0, i.e. the two best asks
-        #     sum to less than $1): "+0.XXX" plus a label naming which combo
-        #     achieves it -- the normal profit display.
-        #   - a guaranteed loss (best_arb <= 0, i.e. the best available
-        #     combo's best asks sum to $1 or more): the actual (negative)
-        #     value -- 1 minus that sum -- plus a red "LOSS" marker, so it's
-        #     clear this pair was evaluated and found unprofitable rather
-        #     than silently missing data.
-        #   - truly missing data (best_arb is None, i.e. neither combo had
-        #     both asks quoted at all): a plain dash.
-        has_profit = best_arb is not None and best_arb > 0
-        has_loss = best_arb is not None and best_arb <= 0
-        if has_profit:
-            arb_str = f"{best_arb:+.3f}"
-            arb_class = _magnitude_class(best_arb)
-            label_html = f'<div class="arb-label">{best_arb_label}</div>'
-        elif has_loss:
-            arb_str = f"{best_arb:.3f}"
-            arb_class = ""
-            # A value that rounds to 0.000 at the displayed precision isn't
-            # really a "loss" -- the two best asks land on exactly $1, i.e.
-            # break-even -- so it gets its own neutral "Balanced" label
-            # rather than the red/lilac LOSS marker.
-            is_balanced = arb_str in ("0.000", "-0.000")
-            label_html = f'<div class="arb-loss">{"Balanced" if is_balanced else "LOSS"}</div>'
-        else:
-            arb_str = "-"
-            arb_class = ""
-            label_html = ""
+        pm_yes_last = f"{pm.yes_price:.3f}" if pm.yes_price is not None else "n/a"
+        pm_no_last = f"{pm.no_price:.3f}" if pm.no_price is not None else "n/a"
+        km_yes_last = f"{km.last_price:.3f}" if km.last_price is not None else "n/a"
+        km_no_last = f"{km.last_no_price:.3f}" if km.last_no_price is not None else "n/a"
+
+        # best_arb/possible_arb (computed upstream in build_section_pairs)
+        # are each already "whichever combo is available": if both
+        # PM-Yes+Kalshi-No and PM-No+Kalshi-Yes are quoted it's the better of
+        # the two, and if only one side has both prices quoted it's simply
+        # that one combo's value.
+        arb_str, arb_class, label_html = _format_arb_cell(best_arb, best_arb_label)
+        heuristic_str, heuristic_class, heuristic_label_html = _format_arb_cell(heuristic_arb, heuristic_arb_label)
+        possible_str, possible_class, possible_label_html = _format_arb_cell(possible_arb, possible_arb_label)
 
         row_class = "row-new" if is_new else ""
         new_badge = '<span class="new-badge">NEW</span> ' if is_new else ""
-        # Each ask price carries its own countdown badge (ticked down client-
-        # side by the <script> at the bottom of render_html) showing seconds
-        # remaining until the page's next auto-refresh pulls a new price.
+        # Each ask/last price carries its own countdown badge (ticked down
+        # client-side by the <script> at the bottom of render_html) showing
+        # seconds remaining until the page's next auto-refresh pulls a new
+        # price.
         countdown = '<div class="countdown"></div>'
         rows.append(f"""
         <tr class="{row_class}">
@@ -652,6 +713,12 @@ def _render_rows(pairs):
           <td class="price ask">{km_yes_ask}{countdown}</td>
           <td class="price ask">{km_no_ask}{countdown}</td>
           <td class="price divider {arb_class}">{arb_str}{label_html}</td>
+          <td class="price ask">{pm_yes_last}{countdown}</td>
+          <td class="price ask">{pm_no_last}{countdown}</td>
+          <td class="price ask">{km_yes_last}{countdown}</td>
+          <td class="price ask">{km_no_last}{countdown}</td>
+          <td class="price divider {heuristic_class}">{heuristic_str}{heuristic_label_html}</td>
+          <td class="price divider {possible_class}">{possible_str}{possible_label_html}</td>
         </tr>""")
     return rows
 
@@ -660,7 +727,9 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     """sections: list of dicts, one per category dropdown, each with:
         key            -- short slug used for HTML element ids (e.g. "politics")
         label          -- display name (e.g. "Politics")
-        pairs          -- list of (score, pm, km, best_arb, best_arb_label, is_new, risk)
+        pairs          -- list of (score, pm, km, best_arb, best_arb_label,
+                           heuristic_arb, heuristic_arb_label,
+                           possible_arb, possible_arb_label, is_new, risk)
                            risk is None for a normal match, or "boundary"
                            for a STRICT_VS_INCLUSIVE match -- rendered in a
                            separate "HIGHER RISK" sub-table at the bottom
@@ -708,13 +777,17 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     thead = """<thead><tr>
       <th>Cosine</th><th>Polymarket question</th><th class="ask">PM Yes Ask</th><th class="ask">PM No Ask</th>
       <th>Kalshi question</th><th class="ask">Kalshi Yes Ask</th><th class="ask">Kalshi No Ask</th>
-      <th class="divider">Best Arb</th>
+      <th class="divider">Immediate Arb</th>
+      <th class="ask">PM Last Yes</th><th class="ask">PM Last No</th>
+      <th class="ask">Kalshi Last Yes</th><th class="ask">Kalshi Last No</th>
+      <th class="divider">Heuristic Arb</th>
+      <th class="divider">Possible Arb</th>
     </tr></thead>"""
 
     section_blocks = []
     for s in sections:
-        normal_pairs = [p for p in s["pairs"] if p[6] != "boundary"]
-        risk_pairs = [p for p in s["pairs"] if p[6] == "boundary"]
+        normal_pairs = [p for p in s["pairs"] if p[10] != "boundary"]
+        risk_pairs = [p for p in s["pairs"] if p[10] == "boundary"]
         rows = _render_rows(normal_pairs)
         risk_rows = _render_rows(risk_pairs)
         section_new_note = f' <span class="new-badge">{s["new_count"]} NEW</span>' if s["new_count"] else ""
@@ -744,7 +817,7 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
   <table id="t-{s['key']}">
     {thead}
     <tbody>
-      {''.join(rows) if rows else f'<tr><td colspan="8">No live {s["label"]} pairs found at this threshold.</td></tr>'}
+      {''.join(rows) if rows else f'<tr><td colspan="14">No live {s["label"]} pairs found at this threshold.</td></tr>'}
     </tbody>
   </table>
   {risk_block}
@@ -781,14 +854,19 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
   /* Fixed per-column widths (same across every table) so the Yes-Diff divider
      lines up at the same x-position in every category/risk table, regardless
      of how long that table's particular question text happens to be. */
-  th:nth-child(1), td:nth-child(1) {{ width: 6%; }}
-  th:nth-child(2), td:nth-child(2) {{ width: 25%; }}
-  th:nth-child(3), td:nth-child(3) {{ width: 8%; }}
-  th:nth-child(4), td:nth-child(4) {{ width: 8%; }}
-  th:nth-child(5), td:nth-child(5) {{ width: 25%; }}
-  th:nth-child(6), td:nth-child(6) {{ width: 8%; }}
-  th:nth-child(7), td:nth-child(7) {{ width: 8%; }}
-  th:nth-child(8), td:nth-child(8) {{ width: 12%; }}
+  th:nth-child(1), td:nth-child(1) {{ width: 4%; }}
+  th:nth-child(2), td:nth-child(2) {{ width: 16%; }}
+  th:nth-child(3), td:nth-child(3) {{ width: 6%; }}
+  th:nth-child(4), td:nth-child(4) {{ width: 6%; }}
+  th:nth-child(5), td:nth-child(5) {{ width: 16%; }}
+  th:nth-child(6), td:nth-child(6) {{ width: 6%; }}
+  th:nth-child(7), td:nth-child(7) {{ width: 6%; }}
+  th:nth-child(8), td:nth-child(8) {{ width: 8%; }}
+  th:nth-child(9), td:nth-child(9) {{ width: 6%; }}
+  th:nth-child(10), td:nth-child(10) {{ width: 6%; }}
+  th:nth-child(11), td:nth-child(11) {{ width: 6%; }}
+  th:nth-child(12), td:nth-child(12) {{ width: 6%; }}
+  th:nth-child(13), td:nth-child(13) {{ width: 8%; }}
   a {{ color: #7aa2ff; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
   .price {{ font-variant-numeric: tabular-nums; text-align: right; }}
@@ -840,16 +918,23 @@ def render_html(sections, out_path, refresh_seconds=None, last_scan_at=None, las
     {total_pairs} live pairs across {len(sections)} categories.
     <span class="ask">Lilac = best ask</span> for each side: PM Yes/No ask from Polymarket's bestBid/bestAsk (No ask = 1&minus;Yes bid);
     Kalshi Yes/No ask derived from its live orderbook the same way.
-    Best Arb = the larger of the two guaranteed-hedge payoffs on a matched pair (buying the opposite outcome on each
-    platform always pays exactly $1 if the two markets resolve identically, before fees/gas/slippage):
+    Immediate Arb = the larger of the two guaranteed-hedge payoffs on a matched pair using each side's best ask (buying
+    the opposite outcome on each platform always pays exactly $1 if the two markets resolve identically, before fees/gas/slippage):
     1.00 &minus; (PM Yes ask + Kalshi No ask), or 1.00 &minus; (PM No ask + Kalshi Yes ask) &mdash; whichever is larger, with its direction labeled underneath.
-    Colored by size when positive:
+    PM Last Yes/No and Kalshi Last Yes/No are each platform's most recent trade price (PM from Gamma's outcomePrices,
+    Kalshi from its last_price_dollars; No = 1&minus;Yes in both cases).
+    Possible Arb is the same 1.00&minus;(sum) calculation as Immediate Arb but using these last-traded prices instead of
+    the current best asks &mdash; the hedge payoff that would have been available at each side's most recent trade.
+    Heuristic Arb mixes the two: one leg at its last-traded price and the other at its best ask (PM last + Kalshi ask, or
+    PM ask + Kalshi last, in either hedge direction), showing 1.00 &minus; (the lowest such sum) with the combo labeled underneath;
+    whenever it beats the all-last-traded value, Possible Arb shows the heuristic value and combo instead.
+    All arb columns are colored by size when positive:
     <span style="color:#ff6b6b">red = smallest (&lt; 0.01)</span>,
     <span style="color:#ffa94d">amber = medium (0.01&ndash;0.03)</span>,
     <span style="color:#51cf66">green = largest (&ge; 0.03)</span>;
-    shown as the (negative) value with a <span class="arb-loss">LOSS</span> marker when the best available combo's two best asks add up to $1 or more (i.e. no guaranteed hedge);
-    shown as &ndash; only when a market is missing best-ask data on both possible combos entirely.
-    Prices refreshed {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{' (auto-refreshing every ' + str(refresh_seconds) + 's -- countdown shown under each ask price)' if refresh_seconds else ''}.{match_note}{new_note}
+    shown as the (negative) value with a <span class="arb-loss">LOSS</span> marker when the best available combo's two prices add up to $1 or more (i.e. no guaranteed hedge);
+    shown as &ndash; only when a market is missing price data on both possible combos entirely.
+    Prices refreshed {time.strftime('%Y-%m-%d %H:%M:%S %Z')}{' (auto-refreshing every ' + str(refresh_seconds) + 's -- countdown shown under each price)' if refresh_seconds else ''}.{match_note}{new_note}
   </div>
   {''.join(section_blocks)}
   <script>
@@ -1029,19 +1114,58 @@ def scan_for_new_matches(model, universe_path, threshold, pm_tag_ids, kalshi_cat
     return new_matches, len(new_pm), len(new_kalshi)
 
 
-def build_section_pairs(cache):
-    """Refresh live prices for one category's cached match set and return
-    the (score, pm, km, best_arb, best_arb_label, is_new, risk) rows
-    render_html expects, plus how many of them are freshly-scanner-found
-    ("NEW").
-
-    best_arb is the larger of the two guaranteed-hedge payoffs for a
-    matched pair (buying the opposite side on each platform always pays
-    out exactly $1 if the two markets truly resolve identically):
-        1.00 - (Polymarket Yes ask + Kalshi No ask)   -- buy PM Yes + K No
-        1.00 - (Polymarket No ask  + Kalshi Yes ask)   -- buy PM No + K Yes
+def _best_hedge_combo(pm_yes, pm_no, km_yes, km_no):
+    """Larger of the two guaranteed-hedge payoffs for a matched pair (buying
+    the opposite side on each platform always pays out exactly $1 if the two
+    markets truly resolve identically):
+        1.00 - (PM Yes-side price + Kalshi No-side price)  -- buy PM Yes + K No
+        1.00 - (PM No-side price  + Kalshi Yes-side price)  -- buy PM No + K Yes
     A positive value is the guaranteed profit per $1 of eventual payout,
-    before fees/gas/slippage."""
+    before fees/gas/slippage. Used for both the Immediate Arb (best ask
+    prices) and Possible Arb (last-traded prices) columns."""
+    candidates = []
+    if pm_yes is not None and km_no is not None:
+        candidates.append((1.00 - (pm_yes + km_no), "Buy PM Yes + Kalshi No"))
+    if pm_no is not None and km_yes is not None:
+        candidates.append((1.00 - (pm_no + km_yes), "Buy PM No + Kalshi Yes"))
+    return max(candidates, key=lambda c: c[0]) if candidates else (None, None)
+
+
+def _heuristic_hedge_combo(pm, km):
+    """Best guaranteed-hedge payoff when each leg may be priced at either its
+    last-traded price or its best ask, mixing the two across platforms:
+    for each direction (PM Yes + Kalshi No, PM No + Kalshi Yes) it tries
+    PM last + Kalshi ask and PM ask + Kalshi last, and returns
+    1.00 - (the lowest sum) with a label naming the legs and which price
+    each one used. The all-ask and all-last combos are already covered by
+    Immediate Arb and Possible Arb respectively."""
+    legs = [
+        (("PM Yes", pm.yes_price, pm.yes_ask), ("Kalshi No", km.last_no_price, km.no_ask)),
+        (("PM No", pm.no_price, pm.no_ask), ("Kalshi Yes", km.last_price, km.yes_ask)),
+    ]
+    candidates = []
+    for (pm_name, pm_last, pm_ask), (k_name, k_last, k_ask) in legs:
+        if pm_last is not None and k_ask is not None:
+            candidates.append((1.00 - (pm_last + k_ask), f"Buy {pm_name} (last) + {k_name} (ask)"))
+        if pm_ask is not None and k_last is not None:
+            candidates.append((1.00 - (pm_ask + k_last), f"Buy {pm_name} (ask) + {k_name} (last)"))
+    return max(candidates, key=lambda c: c[0]) if candidates else (None, None)
+
+
+def build_section_pairs(cache):
+    """Refresh live prices for one category's cached match set and return the
+    (score, pm, km, best_arb, best_arb_label, heuristic_arb, heuristic_arb_label,
+    possible_arb, possible_arb_label, is_new, risk) rows render_html expects, plus how many of them are
+    freshly-scanner-found ("NEW").
+
+    best_arb (rendered as "Immediate Arb") uses each platform's best ask
+    price -- the guaranteed hedge available right now via _best_hedge_combo.
+    possible_arb (rendered as "Possible Arb") uses each platform's last-
+    traded price instead -- what the hedge would have paid at the most
+    recent trade on each side, which can differ from the current ask.
+    heuristic_arb (rendered as "Heuristic Arb") mixes the two -- one leg at
+    its last-traded price, the other at its best ask (_heuristic_hedge_combo)
+    -- and replaces possible_arb whenever it's larger."""
     pairs_meta = cache["pairs"]
     pm_ids = [p["pm_id"] for p in pairs_meta]
     pm_prices = fetch_polymarket_prices_batch(pm_ids) if pm_ids else {}
@@ -1049,6 +1173,7 @@ def build_section_pairs(cache):
     kalshi_markets = [KalshiMarket(ticker=p["kalshi_ticker"], title=p["kalshi_title"], url=p["kalshi_url"]) for p in pairs_meta]
     if kalshi_markets:
         fill_kalshi_orderbook_prices(kalshi_markets)
+        fill_kalshi_last_prices(kalshi_markets)
 
     now = time.time()
     pairs = []
@@ -1057,17 +1182,18 @@ def build_section_pairs(cache):
         pm_yes_price, pm_yes_ask, pm_yes_bid = pm_prices.get(p["pm_id"], (None, None, None))
         pm = PMMarket(id=p["pm_id"], title=p["pm_title"], url=p["pm_url"], yes_price=pm_yes_price, yes_ask=pm_yes_ask, yes_bid=pm_yes_bid)
 
-        candidates = []
-        if pm.yes_ask is not None and km.no_ask is not None:
-            candidates.append((1.00 - (pm.yes_ask + km.no_ask), "Buy PM Yes + Kalshi No"))
-        if pm.no_ask is not None and km.yes_ask is not None:
-            candidates.append((1.00 - (pm.no_ask + km.yes_ask), "Buy PM No + Kalshi Yes"))
-        best_arb, best_arb_label = max(candidates, key=lambda c: c[0]) if candidates else (None, None)
+        best_arb, best_arb_label = _best_hedge_combo(pm.yes_ask, pm.no_ask, km.yes_ask, km.no_ask)
+        possible_arb, possible_arb_label = _best_hedge_combo(pm.yes_price, pm.no_price, km.last_price, km.last_no_price)
+        heuristic_arb, heuristic_arb_label = _heuristic_hedge_combo(pm, km)
+        # If a mixed last/ask combo beats the all-last-traded one, Possible
+        # Arb shows the heuristic value (and its combo) instead.
+        if heuristic_arb is not None and (possible_arb is None or heuristic_arb > possible_arb):
+            possible_arb, possible_arb_label = heuristic_arb, heuristic_arb_label
 
         is_new = (now - p.get("first_seen", 0)) < NEW_BADGE_WINDOW_SECONDS
         if is_new:
             new_count += 1
-        pairs.append((p["score"], pm, km, best_arb, best_arb_label, is_new, p.get("risk")))
+        pairs.append((p["score"], pm, km, best_arb, best_arb_label, heuristic_arb, heuristic_arb_label, possible_arb, possible_arb_label, is_new, p.get("risk")))
     return pairs, new_count
 
 
